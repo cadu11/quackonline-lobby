@@ -1,0 +1,13 @@
+{
+  "name": "quackonline-lobby",
+  "version": "1.0.0",
+  "description": "Servidor de salas do QuackOnline (DuckStation Netplay - WE4 Online)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "GPL-3.0"
+}
