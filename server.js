@@ -186,7 +186,7 @@ function userStatus(u) {
 }
 
 function publicUser(u) {
-  return { id: u.id, nick: u.nick, status: userStatus(u), build: u.build };
+  return { id: u.id, nick: u.nick, status: userStatus(u), build: u.build, country: u.country || '' };
 }
 
 function publicSession(s) {
@@ -195,6 +195,7 @@ function publicSession(s) {
     id: s.id,
     name: s.name,
     host: host ? host.nick : '?',
+    hostCountry: host ? host.country || '' : '',
     game: s.game,
     serial: s.serial,
     build: s.build,
@@ -212,11 +213,11 @@ function sessionDetail(s) {
     hostId: s.hostId,
     members: s.players.map((id, index) => {
       const u = users.get(id);
-      return { id, nick: u ? u.nick : '?', slot: index + 1, ready: !!s.ready[id] };
+      return { id, nick: u ? u.nick : '?', slot: index + 1, ready: !!s.ready[id], country: u ? u.country || '' : '' };
     }),
     watchers: s.spectators.map((id) => {
       const u = users.get(id);
-      return { id, nick: u ? u.nick : '?' };
+      return { id, nick: u ? u.nick : '?', country: u ? u.country || '' : '' };
     }),
     chat: s.chat,
   };
@@ -246,8 +247,13 @@ function sendSessionToMembers(s) {
   }
 }
 
-function sessionChat(s, from, text, system) {
+// key/args: o QuackOnline traduz as mensagens do sistema para o idioma de cada jogador
+function sessionChat(s, from, text, system, key, args) {
   const line = { from, text, system: !!system, t: Date.now() };
+  if (key) {
+    line.key = key;
+    line.args = args || [];
+  }
   s.chat.push(line);
   if (s.chat.length > CHAT_HISTORY) s.chat.shift();
   for (const id of [...s.players, ...s.spectators]) {
@@ -261,6 +267,12 @@ function lobbyChatLine(from, text, system) {
   lobbyChat.push(line);
   if (lobbyChat.length > CHAT_HISTORY) lobbyChat.shift();
   broadcast({ type: 'chat', scope: 'lobby', ...line });
+}
+
+function sendError(u, key, args, text, code) {
+  const msg = { type: 'error', key, args: args || [], text };
+  if (code) msg.code = code;
+  u.conn.send(msg);
 }
 
 function leaveSession(u, reason) {
@@ -279,12 +291,18 @@ function leaveSession(u, reason) {
       const m = users.get(id);
       if (!m) continue;
       m.sessionId = 0;
-      m.conn.send({ type: 'session', session: null, reason: reason || `${u.nick} (host) saiu. A sessão foi fechada.` });
+      m.conn.send({
+        type: 'session',
+        session: null,
+        reason: reason || `${u.nick} (host) saiu. A sessão foi fechada.`,
+        reasonKey: reason ? 'host_disconnected' : 'host_left',
+        reasonArgs: [u.nick],
+      });
     }
     sessions.delete(s.id);
   } else {
     if (s.status !== 'playing') s.status = 'waiting';
-    sessionChat(s, '', `${u.nick} saiu da sessão.`, true);
+    sessionChat(s, '', `${u.nick} saiu da sessão.`, true, 'left_session', [u.nick]);
     sendSessionToMembers(s);
   }
 
@@ -298,6 +316,12 @@ function leaveSession(u, reason) {
 function handleMessage(u, msg) {
   const type = msg.type;
 
+  if (type === 'bye') {
+    // o QuackOnline esta fechando: sai na hora da lista
+    u.conn.close();
+    return;
+  }
+
   if (type === 'ping') {
     u.conn.send({ type: 'pong', t: msg.t });
     return;
@@ -308,12 +332,16 @@ function handleMessage(u, msg) {
 
     const nick = cleanText(msg.nick, MAX_NICK_LENGTH);
     if (nick.length < 2) {
-      u.conn.send({ type: 'error', code: 'nick', text: 'O apelido precisa ter pelo menos 2 letras.' });
+      sendError(u, 'nick_short', [], 'O apelido precisa ter pelo menos 2 letras.', 'nick');
       return;
+    }
+    // mesmo apelido vindo do mesmo IP = o programa foi reaberto: derruba a conexao antiga
+    for (const o of [...users.values()]) {
+      if (o !== u && o.loggedIn && o.nick.toLowerCase() === nick.toLowerCase() && o.ip && o.ip === u.ip) o.conn.close();
     }
     const taken = [...users.values()].some((o) => o.loggedIn && o.nick.toLowerCase() === nick.toLowerCase());
     if (taken) {
-      u.conn.send({ type: 'error', code: 'nick', text: 'Esse apelido já está em uso. Escolha outro.' });
+      sendError(u, 'nick_taken', [], 'Esse apelido já está em uso. Escolha outro.', 'nick');
       return;
     }
 
@@ -365,7 +393,7 @@ function handleMessage(u, msg) {
       };
       sessions.set(s.id, s);
       u.sessionId = s.id;
-      sessionChat(s, '', `${u.nick} criou a sessão.`, true);
+      sessionChat(s, '', `${u.nick} criou a sessão.`, true, 'created', [u.nick]);
       sendSessionToMembers(s);
       broadcastSessions();
       broadcastUsers();
@@ -375,20 +403,20 @@ function handleMessage(u, msg) {
     case 'join_session': {
       const s = sessions.get(parseInt(msg.id, 10));
       if (!s) {
-        u.conn.send({ type: 'error', text: 'Essa sessão não existe mais.' });
+        sendError(u, 'session_gone', [], 'Essa sessão não existe mais.');
         return;
       }
       if (s.build !== u.build) {
-        u.conn.send({ type: 'error', text: `Essa sessão usa outra versão (${s.build}). Atualize o QuackOnline/DuckStation.` });
+        sendError(u, 'other_version', [s.build], `Essa sessão usa outra versão (${s.build}). Atualize o QuackOnline/DuckStation.`);
         return;
       }
       if (s.password && cleanText(msg.password, 30) !== s.password) {
-        u.conn.send({ type: 'error', code: 'password', text: 'Senha errada.' });
+        sendError(u, 'wrong_password', [], 'Senha errada.', 'password');
         return;
       }
       const spectate = !!msg.spectate;
       if (!spectate && s.players.length >= s.maxPlayers) {
-        u.conn.send({ type: 'error', text: 'A sessão está cheia. Você pode entrar para assistir.' });
+        sendError(u, 'session_full', [], 'A sessão está cheia. Você pode entrar para assistir.');
         return;
       }
       if (u.sessionId) leaveSession(u);
@@ -396,11 +424,11 @@ function handleMessage(u, msg) {
       u.sessionId = s.id;
       if (spectate) {
         s.spectators.push(u.id);
-        sessionChat(s, '', `${u.nick} entrou para assistir.`, true);
+        sessionChat(s, '', `${u.nick} entrou para assistir.`, true, 'joined_watch', [u.nick]);
       } else {
         s.players.push(u.id);
         s.ready[u.id] = false;
-        sessionChat(s, '', `${u.nick} entrou na sessão.`, true);
+        sessionChat(s, '', `${u.nick} entrou na sessão.`, true, 'joined', [u.nick]);
       }
       sendSessionToMembers(s);
       broadcastSessions();
@@ -432,17 +460,17 @@ function handleMessage(u, msg) {
       const s = sessions.get(u.sessionId);
       if (!s || s.hostId !== u.id) return;
       if (s.players.length < 2) {
-        u.conn.send({ type: 'error', text: 'Espere o segundo jogador entrar.' });
+        sendError(u, 'wait_second', [], 'Espere o segundo jogador entrar.');
         return;
       }
       const notReady = s.players.filter((id) => id !== s.hostId && !s.ready[id]);
       if (notReady.length) {
-        u.conn.send({ type: 'error', text: 'O outro jogador ainda não marcou "pronto".' });
+        sendError(u, 'not_ready', [], 'O outro jogador ainda não marcou "pronto".');
         return;
       }
       s.status = 'starting';
       s.hostCode = '';
-      sessionChat(s, '', 'Abrindo o DuckStation do host...', true);
+      sessionChat(s, '', 'Abrindo o DuckStation do host...', true, 'opening_host');
       sendSessionToMembers(s);
       broadcastSessions();
       broadcastUsers();
@@ -457,7 +485,7 @@ function handleMessage(u, msg) {
       if (!s || s.hostId !== u.id || !code) return;
       s.hostCode = code;
       s.status = 'playing';
-      sessionChat(s, '', 'Host pronto. Abrindo o DuckStation dos outros jogadores...', true);
+      sessionChat(s, '', 'Host pronto. Abrindo o DuckStation dos outros jogadores...', true, 'host_ready');
       for (const id of s.players) {
         if (id === s.hostId) continue;
         const m = users.get(id);
@@ -480,7 +508,7 @@ function handleMessage(u, msg) {
       s.status = 'waiting';
       s.hostCode = '';
       for (const id of s.players) s.ready[id] = false;
-      sessionChat(s, '', 'A partida terminou.', true);
+      sessionChat(s, '', 'A partida terminou.', true, 'match_ended');
       sendSessionToMembers(s);
       broadcastSessions();
       broadcastUsers();
@@ -490,7 +518,11 @@ function handleMessage(u, msg) {
     case 'launch_failed': {
       const s = sessions.get(u.sessionId);
       if (!s) return;
-      sessionChat(s, '', `${u.nick}: ${cleanText(msg.text, 120) || 'não conseguiu abrir o DuckStation.'}`, true);
+      {
+        const why = cleanText(msg.text, 120);
+        if (why) sessionChat(s, '', `${u.nick}: ${why}`, true, 'launch_failed', [u.nick, why]);
+        else sessionChat(s, '', `${u.nick}: não conseguiu abrir o DuckStation.`, true, 'launch_failed_default', [u.nick]);
+      }
       if (s.hostId === u.id) {
         s.status = 'waiting';
         s.hostCode = '';
@@ -507,6 +539,78 @@ function handleMessage(u, msg) {
 }
 
 // ---------------------------------------------------------------------------
+// Pais pelo IP (para a bandeira). Usa o servico gratuito ip-api.com com cache em memoria.
+// ---------------------------------------------------------------------------
+
+const countryCache = new Map();
+
+function clientIp(req) {
+  // no Render o IP real vem no cabecalho x-forwarded-for
+  const forwarded = (req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+  let ip = forwarded || req.socket.remoteAddress || '';
+  if (ip.startsWith('::ffff:')) ip = ip.slice(7);
+  return ip;
+}
+
+function isPrivateIp(ip) {
+  return (
+    !ip ||
+    ip === '::1' ||
+    ip.startsWith('127.') ||
+    ip.startsWith('10.') ||
+    ip.startsWith('192.168.') ||
+    /^172\.(1[6-9]|2\d|3[01])\./.test(ip) ||
+    ip.startsWith('fc') ||
+    ip.startsWith('fd') ||
+    ip.startsWith('fe80')
+  );
+}
+
+function fetchJson(url) {
+  const lib = url.startsWith('https:') ? require('https') : http;
+  return new Promise((resolve) => {
+    const req = lib.get(url, { timeout: 5000, headers: { 'User-Agent': 'QuackOnline-lobby' } }, (res) => {
+      let body = '';
+      res.setEncoding('utf8');
+      res.on('data', (chunk) => {
+        body += chunk;
+        if (body.length > 4000) req.destroy();
+      });
+      res.on('end', () => {
+        try {
+          resolve(JSON.parse(body));
+        } catch (e) {
+          resolve(null);
+        }
+      });
+    });
+    req.on('timeout', () => req.destroy());
+    req.on('error', () => resolve(null));
+  });
+}
+
+async function lookupCountry(ip) {
+  if (isPrivateIp(ip)) return '';
+  const cached = countryCache.get(ip);
+  if (cached && cached.country && Date.now() - cached.t < 24 * 3600 * 1000) return cached.country;
+
+  let country = '';
+  // 1o servico: ip-api.com
+  const a = await fetchJson(`http://ip-api.com/json/${encodeURIComponent(ip)}?fields=status,countryCode`);
+  if (a && a.status === 'success' && /^[A-Z]{2}$/.test(a.countryCode)) country = a.countryCode;
+  // 2o servico (reserva): ipwho.is
+  if (!country) {
+    const b = await fetchJson(`https://ipwho.is/${encodeURIComponent(ip)}?fields=success,country_code`);
+    if (b && b.success && /^[A-Z]{2}$/.test(b.country_code)) country = b.country_code;
+  }
+  console.log(`pais: ${country || '(desconhecido)'}`);
+
+  if (countryCache.size > 5000) countryCache.clear();
+  countryCache.set(ip, { country, t: Date.now() });
+  return country;
+}
+
+// ---------------------------------------------------------------------------
 // HTTP + upgrade para WebSocket
 // ---------------------------------------------------------------------------
 
@@ -514,6 +618,7 @@ const server = http.createServer((req, res) => {
   // pagina simples (tambem serve para "acordar" o servidor em hospedagens gratuitas)
   const body = JSON.stringify({
     name: 'QuackOnline lobby',
+    version: 3,
     ok: true,
     users: [...users.values()].filter((u) => u.loggedIn).length,
     sessions: sessions.size,
@@ -542,7 +647,19 @@ server.on('upgrade', (req, socket) => {
       `Sec-WebSocket-Accept: ${accept}\r\n\r\n`
   );
 
-  const user = { id: nextUserId++, nick: '', build: '', loggedIn: false, sessionId: 0, conn: null };
+  const ip = clientIp(req);
+  const user = { id: nextUserId++, nick: '', build: '', loggedIn: false, sessionId: 0, conn: null, country: '', ip };
+  // pais do jogador pelo IP (bandeira na lista); o IP fica so na memoria enquanto ele esta conectado
+  lookupCountry(ip).then((country) => {
+    if (!country || !users.has(user.id)) return;
+    user.country = country;
+    if (user.loggedIn) {
+      broadcastUsers();
+      broadcastSessions();
+      const s = sessions.get(user.sessionId);
+      if (s) sendSessionToMembers(s);
+    }
+  });
   user.conn = new Connection(
     socket,
     (msg) => {
