@@ -211,9 +211,17 @@ function sessionDetail(s) {
   return {
     ...publicSession(s),
     hostId: s.hostId,
+    delay: s.delay,
     members: s.players.map((id, index) => {
       const u = users.get(id);
-      return { id, nick: u ? u.nick : '?', slot: index + 1, ready: !!s.ready[id], country: u ? u.country || '' : '' };
+      return {
+        id,
+        nick: u ? u.nick : '?',
+        slot: index + 1,
+        ready: !!s.ready[id],
+        country: u ? u.country || '' : '',
+        ping: u ? u.rtt || 0 : 0,
+      };
     }),
     watchers: s.spectators.map((id) => {
       const u = users.get(id);
@@ -324,6 +332,13 @@ function handleMessage(u, msg) {
 
   if (type === 'ping') {
     u.conn.send({ type: 'pong', t: msg.t });
+    // o QuackOnline manda junto o ping que mediu na vez anterior (para sugerir o atraso de entrada)
+    const rtt = Math.round(Number(msg.rtt) || 0);
+    if (rtt > 0 && rtt < 5000 && rtt !== u.rtt) {
+      u.rtt = rtt;
+      const s = sessions.get(u.sessionId);
+      if (s && s.players.includes(u.id) && s.status === 'waiting') sendSessionToMembers(s);
+    }
     return;
   }
 
@@ -384,6 +399,7 @@ function handleMessage(u, msg) {
         serial: cleanText(msg.serial, 20),
         build: u.build,
         maxPlayers: 2,
+        delay: 2, // atraso de entrada (quadros), o host escolhe na sessao
         players: [u.id],
         spectators: [],
         ready: { [u.id]: false },
@@ -436,7 +452,7 @@ function handleMessage(u, msg) {
 
       // espectador chegando com a partida ja rolando: entra direto no DuckStation
       if (spectate && s.status === 'playing' && s.hostCode) {
-        u.conn.send({ type: 'launch', role: 'spectator', hostCode: s.hostCode, session: sessionDetail(s) });
+        u.conn.send({ type: 'launch', role: 'spectator', hostCode: s.hostCode, delay: s.delay, session: sessionDetail(s) });
       }
       return;
     }
@@ -445,6 +461,18 @@ function handleMessage(u, msg) {
       if (u.sessionId) leaveSession(u);
       broadcastSessions();
       broadcastUsers();
+      return;
+    }
+
+    case 'set_delay': {
+      // so o host escolhe o atraso de entrada, antes de iniciar
+      const s = sessions.get(u.sessionId);
+      if (!s || s.hostId !== u.id || s.status !== 'waiting') return;
+      const delay = Math.max(0, Math.min(10, Math.round(Number(msg.delay))));
+      if (!Number.isFinite(delay) || delay === s.delay) return;
+      s.delay = delay;
+      sessionChat(s, '', `Atraso de entrada: ${delay} quadros.`, true, 'delay_set', [String(delay)]);
+      sendSessionToMembers(s);
       return;
     }
 
@@ -474,7 +502,7 @@ function handleMessage(u, msg) {
       sendSessionToMembers(s);
       broadcastSessions();
       broadcastUsers();
-      u.conn.send({ type: 'launch', role: 'host', session: sessionDetail(s) });
+      u.conn.send({ type: 'launch', role: 'host', delay: s.delay, session: sessionDetail(s) });
       return;
     }
 
@@ -489,11 +517,11 @@ function handleMessage(u, msg) {
       for (const id of s.players) {
         if (id === s.hostId) continue;
         const m = users.get(id);
-        if (m) m.conn.send({ type: 'launch', role: 'guest', hostCode: code, session: sessionDetail(s) });
+        if (m) m.conn.send({ type: 'launch', role: 'guest', hostCode: code, delay: s.delay, session: sessionDetail(s) });
       }
       for (const id of s.spectators) {
         const m = users.get(id);
-        if (m) m.conn.send({ type: 'launch', role: 'spectator', hostCode: code, session: sessionDetail(s) });
+        if (m) m.conn.send({ type: 'launch', role: 'spectator', hostCode: code, delay: s.delay, session: sessionDetail(s) });
       }
       sendSessionToMembers(s);
       broadcastSessions();
@@ -618,7 +646,7 @@ const server = http.createServer((req, res) => {
   // pagina simples (tambem serve para "acordar" o servidor em hospedagens gratuitas)
   const body = JSON.stringify({
     name: 'QuackOnline lobby',
-    version: 3,
+    version: 4,
     ok: true,
     users: [...users.values()].filter((u) => u.loggedIn).length,
     sessions: sessions.size,
