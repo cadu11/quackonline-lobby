@@ -7,6 +7,8 @@
 'use strict';
 
 const http = require('http');
+
+const MAX_SPECTATORS = 2; // no maximo 2 pessoas assistindo (igual ao DuckStation, core/netplay.h)
 const crypto = require('crypto');
 
 const PORT = parseInt(process.env.PORT || '8080', 10);
@@ -471,6 +473,11 @@ function handleMessage(u, msg) {
         sendError(u, 'session_full', [], 'A sessão está cheia. Você pode entrar para assistir.');
         return;
       }
+      // o netplay do DuckStation aceita no maximo 4 espectadores por partida
+      if (spectate && s.spectators.length >= MAX_SPECTATORS) {
+        sendError(u, 'spectators_full', [String(MAX_SPECTATORS)], `Esta partida já tem ${MAX_SPECTATORS} pessoas assistindo (o máximo).`);
+        return;
+      }
       if (u.sessionId) leaveSession(u);
 
       u.sessionId = s.id;
@@ -690,7 +697,7 @@ const server = http.createServer((req, res) => {
   // pagina simples (tambem serve para "acordar" o servidor em hospedagens gratuitas)
   const body = JSON.stringify({
     name: 'QuackOnline lobby',
-    version: 6,
+    version: 8,
     ok: true,
     users: [...users.values()].filter((u) => u.loggedIn).length,
     sessions: sessions.size,
