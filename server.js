@@ -235,6 +235,8 @@ function publicSession(s, viewer) {
     spectators: s.spectators.length,
     status: s.status,
     hasPassword: !!s.password,
+    allowSpectators: s.allowSpectators !== false,
+    maxSpectators: MAX_SPECTATORS,
   };
 }
 
@@ -438,6 +440,7 @@ function handleMessage(u, msg) {
         build: u.build,
         maxPlayers: 2,
         delay: 2, // atraso de entrada (quadros), o host escolhe na sessao
+        allowSpectators: msg.allowSpectators !== false, // o host decide se outras pessoas podem assistir
         players: [u.id],
         spectators: [],
         ready: { [u.id]: false },
@@ -473,7 +476,11 @@ function handleMessage(u, msg) {
         sendError(u, 'session_full', [], 'A sessão está cheia. Você pode entrar para assistir.');
         return;
       }
-      // o netplay do DuckStation aceita no maximo 4 espectadores por partida
+      if (spectate && s.allowSpectators === false) {
+        sendError(u, 'spectators_off', [], 'O host não permite assistir esta partida.');
+        return;
+      }
+      // limite de espectadores (igual ao netplay do DuckStation)
       if (spectate && s.spectators.length >= MAX_SPECTATORS) {
         sendError(u, 'spectators_full', [String(MAX_SPECTATORS)], `Esta partida já tem ${MAX_SPECTATORS} pessoas assistindo (o máximo).`);
         return;
@@ -517,6 +524,41 @@ function handleMessage(u, msg) {
       s.delay = delay;
       sessionChat(s, '', `Atraso de entrada: ${delay} quadros.`, true, 'delay_set', [String(delay)]);
       sendSessionToMembers(s);
+      return;
+    }
+
+    case 'set_spectators': {
+      // o host liga/desliga "permitir assistir"; ao desligar, quem estava assistindo sai da sessao
+      const s = sessions.get(u.sessionId);
+      if (!s || s.hostId !== u.id) return;
+      const allow = !!msg.allow;
+      if (allow === (s.allowSpectators !== false)) return;
+      s.allowSpectators = allow;
+      if (!allow) {
+        for (const id of s.spectators) {
+          const m = users.get(id);
+          if (!m) continue;
+          m.sessionId = 0;
+          m.conn.send({
+            type: 'session',
+            session: null,
+            reason: 'O host desativou a opção de assistir.',
+            reasonKey: 'spectators_removed',
+            reasonArgs: [],
+          });
+        }
+        s.spectators = [];
+      }
+      sessionChat(
+        s,
+        '',
+        allow ? 'Agora outras pessoas podem assistir.' : 'O host desativou a opção de assistir.',
+        true,
+        allow ? 'spectators_on_msg' : 'spectators_removed'
+      );
+      sendSessionToMembers(s);
+      broadcastSessions();
+      broadcastUsers();
       return;
     }
 
@@ -697,7 +739,7 @@ const server = http.createServer((req, res) => {
   // pagina simples (tambem serve para "acordar" o servidor em hospedagens gratuitas)
   const body = JSON.stringify({
     name: 'QuackOnline lobby',
-    version: 8,
+    version: 9,
     ok: true,
     users: [...users.values()].filter((u) => u.loggedIn).length,
     sessions: sessions.size,
