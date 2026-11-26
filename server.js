@@ -185,17 +185,46 @@ function userStatus(u) {
   return s.status === 'playing' || s.status === 'starting' ? 'jogando' : 'na sala';
 }
 
-function publicUser(u) {
-  return { id: u.id, nick: u.nick, status: userStatus(u), build: u.build, country: u.country || '' };
+// Distancia aproximada (km) entre dois jogadores, pela localizacao do IP (cidade aproximada).
+// As coordenadas nunca sao enviadas aos jogadores: so a distancia. -1 = desconhecida.
+function distanceKm(a, b) {
+  if (!a || !b || a.lat == null || b.lat == null) return -1;
+  if (a === b) return 0;
+  const rad = Math.PI / 180;
+  const dLat = (b.lat - a.lat) * rad;
+  const dLon = (b.lon - a.lon) * rad;
+  const h = Math.sin(dLat / 2) ** 2 + Math.cos(a.lat * rad) * Math.cos(b.lat * rad) * Math.sin(dLon / 2) ** 2;
+  return Math.round(2 * 6371 * Math.asin(Math.min(1, Math.sqrt(h))));
 }
 
-function publicSession(s) {
+// viewer: quem vai receber a lista (a distancia e calculada em relacao a ele)
+function publicUser(u, viewer) {
+  return {
+    id: u.id,
+    nick: u.nick,
+    status: userStatus(u),
+    build: u.build,
+    country: u.country || '',
+    km: distanceKm(viewer, u),
+  };
+}
+
+function usersFor(viewer) {
+  return [...users.values()].filter((u) => u.loggedIn).map((u) => publicUser(u, viewer));
+}
+
+function sessionsFor(viewer) {
+  return [...sessions.values()].map((s) => publicSession(s, viewer));
+}
+
+function publicSession(s, viewer) {
   const host = users.get(s.hostId);
   return {
     id: s.id,
     name: s.name,
     host: host ? host.nick : '?',
     hostCountry: host ? host.country || '' : '',
+    hostKm: distanceKm(viewer, host),
     game: s.game,
     serial: s.serial,
     build: s.build,
@@ -208,10 +237,13 @@ function publicSession(s) {
 }
 
 function sessionDetail(s) {
+  const p1 = users.get(s.players[0]);
+  const p2 = users.get(s.players[1]);
   return {
-    ...publicSession(s),
+    ...publicSession(s, null),
     hostId: s.hostId,
     delay: s.delay,
+    playersKm: p2 ? distanceKm(p1, p2) : -1, // distancia entre 1P e 2P (sugestao do atraso)
     members: s.players.map((id, index) => {
       const u = users.get(id);
       return {
@@ -240,11 +272,15 @@ function broadcast(obj, filter) {
 }
 
 function broadcastUsers() {
-  broadcast({ type: 'users', users: [...users.values()].filter((u) => u.loggedIn).map(publicUser) });
+  for (const u of users.values()) {
+    if (u.loggedIn) u.conn.send({ type: 'users', users: usersFor(u) });
+  }
 }
 
 function broadcastSessions() {
-  broadcast({ type: 'sessions', sessions: [...sessions.values()].map(publicSession) });
+  for (const u of users.values()) {
+    if (u.loggedIn) u.conn.send({ type: 'sessions', sessions: sessionsFor(u) });
+  }
 }
 
 function sendSessionToMembers(s) {
@@ -366,8 +402,8 @@ function handleMessage(u, msg) {
     u.conn.send({
       type: 'welcome',
       you: { id: u.id, nick: u.nick },
-      users: [...users.values()].filter((o) => o.loggedIn).map(publicUser),
-      sessions: [...sessions.values()].map(publicSession),
+      users: usersFor(u),
+      sessions: sessionsFor(u),
       chat: lobbyChat,
     });
     broadcastUsers();
@@ -468,7 +504,8 @@ function handleMessage(u, msg) {
       // so o host escolhe o atraso de entrada, antes de iniciar
       const s = sessions.get(u.sessionId);
       if (!s || s.hostId !== u.id || s.status !== 'waiting') return;
-      const delay = Math.max(0, Math.min(10, Math.round(Number(msg.delay))));
+      // acima de 4 quadros o jogo fica pior em qualquer distancia
+      const delay = Math.max(0, Math.min(4, Math.round(Number(msg.delay))));
       if (!Number.isFinite(delay) || delay === s.delay) return;
       s.delay = delay;
       sessionChat(s, '', `Atraso de entrada: ${delay} quadros.`, true, 'delay_set', [String(delay)]);
@@ -617,25 +654,32 @@ function fetchJson(url) {
   });
 }
 
-async function lookupCountry(ip) {
-  if (isPrivateIp(ip)) return '';
+// Pais + localizacao aproximada (cidade) pelo IP. Retorna { country, lat, lon } ou null.
+async function lookupGeo(ip) {
+  if (isPrivateIp(ip)) return null;
   const cached = countryCache.get(ip);
-  if (cached && cached.country && Date.now() - cached.t < 24 * 3600 * 1000) return cached.country;
+  if (cached && cached.geo && Date.now() - cached.t < 24 * 3600 * 1000) return cached.geo;
 
-  let country = '';
+  let geo = null;
   // 1o servico: ip-api.com
-  const a = await fetchJson(`http://ip-api.com/json/${encodeURIComponent(ip)}?fields=status,countryCode`);
-  if (a && a.status === 'success' && /^[A-Z]{2}$/.test(a.countryCode)) country = a.countryCode;
+  const a = await fetchJson(`http://ip-api.com/json/${encodeURIComponent(ip)}?fields=status,countryCode,lat,lon`);
+  if (a && a.status === 'success' && /^[A-Z]{2}$/.test(a.countryCode))
+    geo = { country: a.countryCode, lat: Number(a.lat), lon: Number(a.lon) };
   // 2o servico (reserva): ipwho.is
-  if (!country) {
-    const b = await fetchJson(`https://ipwho.is/${encodeURIComponent(ip)}?fields=success,country_code`);
-    if (b && b.success && /^[A-Z]{2}$/.test(b.country_code)) country = b.country_code;
+  if (!geo) {
+    const b = await fetchJson(`https://ipwho.is/${encodeURIComponent(ip)}?fields=success,country_code,latitude,longitude`);
+    if (b && b.success && /^[A-Z]{2}$/.test(b.country_code))
+      geo = { country: b.country_code, lat: Number(b.latitude), lon: Number(b.longitude) };
   }
-  console.log(`pais: ${country || '(desconhecido)'}`);
+  if (geo && (!Number.isFinite(geo.lat) || !Number.isFinite(geo.lon))) {
+    geo.lat = null;
+    geo.lon = null;
+  }
+  console.log(`pais: ${geo ? geo.country : '(desconhecido)'}`);
 
   if (countryCache.size > 5000) countryCache.clear();
-  countryCache.set(ip, { country, t: Date.now() });
-  return country;
+  countryCache.set(ip, { geo, t: Date.now() });
+  return geo;
 }
 
 // ---------------------------------------------------------------------------
@@ -646,7 +690,7 @@ const server = http.createServer((req, res) => {
   // pagina simples (tambem serve para "acordar" o servidor em hospedagens gratuitas)
   const body = JSON.stringify({
     name: 'QuackOnline lobby',
-    version: 4,
+    version: 6,
     ok: true,
     users: [...users.values()].filter((u) => u.loggedIn).length,
     sessions: sessions.size,
@@ -678,9 +722,11 @@ server.on('upgrade', (req, socket) => {
   const ip = clientIp(req);
   const user = { id: nextUserId++, nick: '', build: '', loggedIn: false, sessionId: 0, conn: null, country: '', ip };
   // pais do jogador pelo IP (bandeira na lista); o IP fica so na memoria enquanto ele esta conectado
-  lookupCountry(ip).then((country) => {
-    if (!country || !users.has(user.id)) return;
-    user.country = country;
+  lookupGeo(ip).then((geo) => {
+    if (!geo || !users.has(user.id)) return;
+    user.country = geo.country;
+    user.lat = geo.lat;
+    user.lon = geo.lon;
     if (user.loggedIn) {
       broadcastUsers();
       broadcastSessions();
