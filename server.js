@@ -15,7 +15,7 @@ const PORT = parseInt(process.env.PORT || '8080', 10);
 const MAX_USERS = 500;
 const MAX_MESSAGE_BYTES = 8 * 1024;
 const MAX_CHAT_LENGTH = 200;
-const MAX_NICK_LENGTH = 20;
+const MAX_NICK_LENGTH = 12; // apelido curto: cabe numa linha na lista de jogadores (igual ao QuackOnline)
 const MAX_SESSION_NAME = 40;
 const PING_INTERVAL_MS = 25000;
 const CHAT_HISTORY = 30;
@@ -739,7 +739,7 @@ const server = http.createServer((req, res) => {
   // pagina simples (tambem serve para "acordar" o servidor em hospedagens gratuitas)
   const body = JSON.stringify({
     name: 'QuackOnline lobby',
-    version: 9,
+    version: 10,
     ok: true,
     users: [...users.values()].filter((u) => u.loggedIn).length,
     sessions: sessions.size,
